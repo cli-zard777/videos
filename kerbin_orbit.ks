@@ -1,44 +1,31 @@
 // ================================================================
-// kerbin_orbit.ks  (v3 – guaranteed circ burn window)
+// kerbin_orbit.ks  (v5)
 // kOS  –  n-stage liquid rocket, circular equatorial Kerbin orbit
 //
 // How to use
 //   Copy to Ships/Script/, open kOS terminal, type:  run kerbin_orbit.
 //
-// v3 → v4 change
-//   Circularisation now steers to the maneuver node's BURNVECTOR
-//   instead of raw PROGRADE.  During a long burn the prograde
-//   vector drifts as the orbit evolves, pushing the burn off-axis
-//   and raising the apoapsis.  BURNVECTOR always points in the
-//   direction of the *remaining* Δv needed to hit the target orbit,
-//   so it self-corrects throughout the burn.
-//
-// v2 → v3 change
-//   Added an apoapsis-timing check after the craft exits the
-//   atmosphere.  The circularisation burn must be centred on
-//   apoapsis, which requires at least (burn_time / 2 + margin)
-//   seconds of lead time when the burn starts.  Low-TWR rockets
-//   with long burn times can exit the atmosphere with less ETA
-//   to apoapsis than they need.  If that happens, a short prograde
-//   correction burn raises the apoapsis (and therefore the ETA)
-//   until the window is wide enough.  A guard prevents the
-//   correction from firing if the craft is already within 20 s of
-//   apoapsis, where a prograde burn raises periapsis instead.
-//
-// v1 → v2 change
-//   Replaced the prescribed linear pitch schedule with a natural
-//   gravity turn (follow prograde after a small kick).  Keeps
-//   thrust aligned with the velocity vector → minimum AoA drag
-//   and gravity losses; self-adapts to any TWR.
+// Changelog
+//   v5 – Revert gravity turn to original controlled pitch schedule
+//        (linear 90°→0° from TURN_START to TURN_END altitude).
+//        Add auto-staging inside the circularisation burn so a
+//        stage boundary mid-burn is handled gracefully.
+//   v4 – Circularisation steers via maneuver node BURNVECTOR
+//        instead of raw PROGRADE (prevents apoapsis creep).
+//   v3 – Apoapsis timing check + correction burn for low-TWR craft.
+//   v2 – Natural gravity turn (follow prograde).
 // ================================================================
 
 CLEARSCREEN.
 
 // ── Configuration ────────────────────────────────────────────────
-LOCAL TARGET_ALT IS 100000.  // m  – target circular orbit altitude
-LOCAL KICK_SPEED IS 100.     // m/s surface speed to trigger gravity turn
-LOCAL KICK_PITCH IS 80.      // °   – 80° = 10° from vertical (east)
-LOCAL ATMO_ALT   IS 70000.   // m  – coast above this before circularising
+LOCAL TARGET_ALT     IS 100000.  // m – target circular orbit altitude
+LOCAL TURN_START     IS  10000.  // m – begin pitching east
+LOCAL TURN_END       IS  45000.  // m – pitch-over complete (0°)
+LOCAL MAX_Q_THROTTLE IS    0.7.  // throttle cap through max-Q band
+LOCAL MAX_Q_ALT_LO   IS  20000.  // m – start throttle reduction
+LOCAL MAX_Q_ALT_HI   IS  35000.  // m – restore full throttle
+LOCAL ATMO_ALT       IS  70000.  // m – coast above this before circularising
 
 // ── Helpers ──────────────────────────────────────────────────────
 
@@ -58,6 +45,23 @@ FUNCTION avg_isp {
     }
     IF n = 0 { RETURN 300. }
     RETURN s / n.
+}
+
+// Linear pitch interpolation from 90° (vertical) to 0° (horizontal).
+FUNCTION turn_pitch {
+    IF SHIP:ALTITUDE <= TURN_START { RETURN 90. }
+    IF SHIP:ALTITUDE >= TURN_END   { RETURN  0. }
+    LOCAL frac IS (SHIP:ALTITUDE - TURN_START) / (TURN_END - TURN_START).
+    RETURN 90 * (1 - frac).
+}
+
+// Throttle cap through the max-Q band.
+FUNCTION safe_throttle {
+    PARAMETER nominal.
+    IF SHIP:ALTITUDE >= MAX_Q_ALT_LO AND SHIP:ALTITUDE <= MAX_Q_ALT_HI {
+        RETURN MIN(nominal, MAX_Q_THROTTLE).
+    }
+    RETURN nominal.
 }
 
 // Circularisation Δv at current apoapsis (vis-viva).
@@ -82,17 +86,16 @@ FUNCTION burn_time {
 //  PHASE 0 – Pre-launch
 // ================================================================
 PRINT "╔══════════════════════════════════════════════╗".
-PRINT "║  KERBIN ORBITAL LAUNCH  v4  –  kOS           ║".
+PRINT "║  KERBIN ORBITAL LAUNCH  v5  –  kOS           ║".
 PRINT "╠══════════════════════════════════════════════╣".
 PRINT "║  Target orbit : " + TARGET_ALT/1000 + " km circular              ║".
-PRINT "║  Turn trigger : " + KICK_SPEED + " m/s surface speed         ║".
-PRINT "║  Kick pitch   : " + KICK_PITCH + "° (" + (90-KICK_PITCH) + "° from vertical)         ║".
+PRINT "║  Gravity turn : " + TURN_START/1000 + " km → " + TURN_END/1000 + " km                 ║".
 PRINT "╚══════════════════════════════════════════════╝".
 PRINT "".
 
 SAS OFF. RCS OFF.
 LOCK THROTTLE TO 0.
-LOCK STEERING TO HEADING(90, 90).   // due east, straight up
+LOCK STEERING TO HEADING(90, 90).  // due east, straight up
 
 FROM { LOCAL t IS 5. } UNTIL t = 0 STEP { SET t TO t-1. } DO {
     PRINT "  T-" + t + "…". WAIT 1.
@@ -101,84 +104,57 @@ PRINT "[T-0] IGNITION".
 PRINT "".
 
 // ================================================================
-//  PHASE 1 – Vertical ascent
+//  PHASE 1 – Vertical ascent to TURN_START
 // ================================================================
 STAGE.
 LOCK THROTTLE TO 1.0.
-WAIT UNTIL SHIP:ALTITUDE > 100.     // clear the pad
+WAIT UNTIL SHIP:ALTITUDE > 100.  // clear the pad
 
-PRINT "[PHASE 1] Vertical ascent to " + KICK_SPEED + " m/s…".
-WAIT UNTIL SHIP:VELOCITY:SURFACE:MAG >= KICK_SPEED.
-
-// ================================================================
-//  PHASE 2 – Gravity turn initiation (pitch kick + prograde lock)
-// ================================================================
-PRINT "[PHASE 2] Pitch kick → prograde lock".
-
-// Apply the kick and wait for the rocket to physically rotate to
-// that heading before handing control to the prograde vector.
-// Cap the wait at 8 s so a very slow rocket doesn't stall here.
-LOCK STEERING TO HEADING(90, KICK_PITCH).
-LOCAL kick_deadline IS TIME:SECONDS + 8.
-WAIT UNTIL VANG(SHIP:FACING:FOREVECTOR, HEADING(90, KICK_PITCH):FOREVECTOR) < 3
-       OR  TIME:SECONDS > kick_deadline.
-
-// Hand off – the prograde vector now guides the entire ascent.
-LOCK STEERING TO SRFPROGRADE.
+PRINT "[PHASE 1] Vertical ascent to " + TURN_START/1000 + " km".
+WAIT UNTIL SHIP:ALTITUDE >= TURN_START.
 
 // ================================================================
-//  PHASE 3 – Gravity turn ascent + staging
+//  PHASE 2 – Gravity turn + staging
 // ================================================================
-PRINT "[PHASE 3] Following prograde – natural gravity turn".
+PRINT "[PHASE 2] Gravity turn (" + TURN_START/1000 + " km → " + TURN_END/1000 + " km)".
 
 UNTIL SHIP:APOAPSIS >= TARGET_ALT {
 
+    // ── Pitch schedule ─────────────────────────────────────────
+    LOCK STEERING TO HEADING(90, turn_pitch()).
+
+    // ── Throttle (max-Q cap + apoapsis taper) ──────────────────
+    LOCAL ratio IS SHIP:APOAPSIS / TARGET_ALT.
+    LOCAL nominal IS 1.0.
+    IF ratio > 0.90 {
+        SET nominal TO MAX(0.05, (1.0 - ratio) * 10).
+    }
+    LOCK THROTTLE TO safe_throttle(nominal).
+
     // ── Staging ────────────────────────────────────────────────
     IF engines_flameout() AND STAGE:READY {
-        PRINT "  [STAGE] Burnout detected – separating.".
+        PRINT "  [STAGE] Burnout – separating stage.".
         LOCK THROTTLE TO 0.
-        WAIT 0.5.
+        WAIT 1.
         STAGE.
         WAIT UNTIL AVAILABLETHRUST > 0 OR NOT STAGE:READY.
         LOCK THROTTLE TO 1.0.
         PRINT "  [STAGE] Next stage ignition.".
     }
 
-    // ── Steering reference ─────────────────────────────────────
-    // Surface prograde and orbital prograde converge above ~50 km;
-    // switch to the orbital frame for a cleaner lock in thin air.
-    IF SHIP:ALTITUDE > 50000 {
-        LOCK STEERING TO PROGRADE.
-    } ELSE {
-        LOCK STEERING TO SRFPROGRADE.
-    }
-
-    // ── Throttle taper as apoapsis closes on target ─────────────
-    // Full power until 90 % of target, then linear ramp to near-
-    // zero.  Prevents apoapsis overshoot without choking climb rate
-    // prematurely.
-    LOCAL ratio IS SHIP:APOAPSIS / TARGET_ALT.
-    IF ratio >= 0.90 {
-        LOCK THROTTLE TO MAX(0.03, (1.0 - ratio) / 0.10).
-    } ELSE {
-        LOCK THROTTLE TO 1.0.
-    }
-
     WAIT 0.05.
 }
 
 // ================================================================
-//  PHASE 4 – Cut engines, coast above atmosphere
+//  PHASE 3 – Cut engines, coast above atmosphere
 // ================================================================
 LOCK THROTTLE TO 0.
 LOCK STEERING TO PROGRADE.
 
-PRINT "[PHASE 4] Apoapsis secured – coasting out of atmosphere.".
+PRINT "[PHASE 3] Apoapsis secured – coasting.".
 PRINT "  Apoapsis  : " + ROUND(SHIP:APOAPSIS  / 1000, 1) + " km".
 PRINT "  Periapsis : " + ROUND(SHIP:PERIAPSIS / 1000, 1) + " km".
 
-// Burning inside the atmosphere wastes Δv on drag.  Wait until
-// above ATMO_ALT before starting the circularisation timer.
 WAIT UNTIL SHIP:ALTITUDE >= ATMO_ALT.
 
 LOCAL dv IS circ_dv().
@@ -188,62 +164,71 @@ PRINT "  Burn time : " + ROUND(bt,  1) + " s".
 PRINT "  ETA apo   : " + ROUND(ETA:APOAPSIS, 0) + " s".
 
 // ── Apoapsis timing check ────────────────────────────────────────
-// The burn must be centred on apoapsis, so it must START at
-// (burn_time / 2) seconds before apoapsis.  If ETA:APOAPSIS is
-// smaller than that required lead time we won't reach the start
-// cue before the window closes — especially likely for low-TWR
-// rockets with long burn times.
-//
-// Guard: skip correction if already within 20 s of apoapsis —
-// a prograde burn there raises periapsis rather than apoapsis and
-// would corrupt the orbit.  In that edge case just burn immediately
-// (slightly off-centre) and let the eccentricity check tighten it.
-LOCAL lead_needed IS bt / 2 + 30.  // half-burn + 30 s comfort margin
+// The burn must be centred on apoapsis, requiring at least
+// (burn_time/2 + 30 s) of lead time when the burn starts.
+// If ETA is short (common for low-TWR rockets), fire a brief
+// prograde correction to raise the apoapsis and extend the window.
+// Guard: skip if already within 20 s of apoapsis – a prograde burn
+// there raises periapsis instead.
+LOCAL lead_needed IS bt / 2 + 30.
 
 IF ETA:APOAPSIS < lead_needed AND ETA:APOAPSIS > 20 {
     PRINT "[TIMING] ETA " + ROUND(ETA:APOAPSIS, 0) + " s < required " + ROUND(lead_needed, 0) + " s.".
-    PRINT "  Prograde correction burn – extending apoapsis ETA…".
+    PRINT "  Extending apoapsis…".
     LOCK STEERING TO PROGRADE.
     LOCK THROTTLE TO 0.2.
-    // Burn until there is enough lead time, or until apoapsis has
-    // risen to 3× target (safety cap to prevent runaway burn).
     WAIT UNTIL ETA:APOAPSIS > burn_time(circ_dv()) + 60
             OR SHIP:APOAPSIS > TARGET_ALT * 3.
     LOCK THROTTLE TO 0.
     SET dv TO circ_dv().
     SET bt TO burn_time(dv).
-    PRINT "  Correction done. ETA: " + ROUND(ETA:APOAPSIS, 0) + " s  |  Apo: " + ROUND(SHIP:APOAPSIS / 1000, 1) + " km".
-    PRINT "  Updated circ Δv : " + ROUND(dv, 1) + " m/s  |  burn: " + ROUND(bt, 1) + " s".
+    PRINT "  New ETA: " + ROUND(ETA:APOAPSIS, 0) + " s  |  Apo: " + ROUND(SHIP:APOAPSIS / 1000, 1) + " km".
 }
 
 // ================================================================
-//  PHASE 5 – Circularisation burn via maneuver node
+//  PHASE 4 – Circularisation burn via maneuver node
 // ================================================================
-// Steering to nd:BURNVECTOR rather than raw PROGRADE is critical.
-// Raw PROGRADE drifts during a long burn as the orbit evolves,
-// which tips the burn off-axis and raises the apoapsis instead of
-// holding it fixed while periapsis climbs.  The node's BURNVECTOR
-// always points in the direction of the REMAINING Δv needed to
-// achieve the target orbit, so it self-corrects throughout the burn.
+// Steer to nd:BURNVECTOR, NOT raw PROGRADE.  Raw PROGRADE drifts
+// as the orbit evolves mid-burn and raises the apoapsis instead of
+// holding it fixed while periapsis climbs.  BURNVECTOR always
+// points toward the remaining Δv needed to hit the node's target
+// orbit, so it self-corrects throughout the burn.
 
-LOCAL nd IS NODE(TIME:SECONDS + ETA:APOAPSIS, 0, 0, circ_dv()).
+LOCAL nd IS NODE(TIME:SECONDS + ETA:APOAPSIS, 0, 0, dv).
 ADD nd.
 
-PRINT "[PHASE 5] Circularisation node created.".
+PRINT "[PHASE 4] Circularisation node created.".
 PRINT "  Node Δv   : " + ROUND(nd:DELTAV:MAG, 1) + " m/s".
 PRINT "  Node ETA  : " + ROUND(nd:ETA, 0) + " s".
 PRINT "  Burn time : " + ROUND(burn_time(nd:DELTAV:MAG), 1) + " s".
 
-// Orient toward the burn vector with plenty of lead time.
 LOCK STEERING TO nd:BURNVECTOR.
 WAIT UNTIL nd:ETA <= burn_time(nd:DELTAV:MAG) / 2 + 5.
-LOCK STEERING TO nd:BURNVECTOR.   // re-lock after potential warp drift
+LOCK STEERING TO nd:BURNVECTOR.  // re-acquire after potential drift
 WAIT UNTIL nd:ETA <= burn_time(nd:DELTAV:MAG) / 2.
 
-PRINT "[PHASE 5] Circularisation burn – IGNITION.".
+PRINT "[PHASE 4] Circularisation – IGNITION.".
 LOCK THROTTLE TO 1.0.
 
 UNTIL nd:DELTAV:MAG < 0.5 {
+
+    // ── Auto-staging mid-burn ─────────────────────────────────
+    // If a stage is exhausted during the circularisation burn,
+    // cut throttle briefly, fire the decoupler/next stage, wait
+    // for new engines to spool up, then re-lock the burn vector
+    // and continue.  Without this the burn stops silently and
+    // leaves the orbit incomplete.
+    IF engines_flameout() AND STAGE:READY {
+        PRINT "  [STAGE] Stage boundary during circ burn.".
+        LOCK THROTTLE TO 0.
+        WAIT 0.3.
+        STAGE.
+        WAIT UNTIL AVAILABLETHRUST > 0 OR NOT STAGE:READY.
+        LOCK STEERING TO nd:BURNVECTOR.
+        LOCK THROTTLE TO 1.0.
+        PRINT "  [STAGE] Resumed.".
+    }
+
     LOCAL rem IS nd:DELTAV:MAG.
     IF      rem < 5  { LOCK THROTTLE TO 0.02. }
     ELSE IF rem < 20 { LOCK THROTTLE TO 0.10. }
