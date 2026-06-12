@@ -1,30 +1,27 @@
 // ================================================================
-// kerbin_orbit.ks  (v2 – Δv-optimal ascent)
+// kerbin_orbit.ks  (v3 – guaranteed circ burn window)
 // kOS  –  n-stage liquid rocket, circular equatorial Kerbin orbit
 //
 // How to use
 //   Copy to Ships/Script/, open kOS terminal, type:  run kerbin_orbit.
 //
-// What changed from v1
-//   The old script used a linear pitch schedule (altitude → pitch).
-//   That forced a fixed attitude regardless of the actual velocity
-//   vector, creating angle-of-attack drag and gravity losses.
+// v2 → v3 change
+//   Added an apoapsis-timing check after the craft exits the
+//   atmosphere.  The circularisation burn must be centred on
+//   apoapsis, which requires at least (burn_time / 2 + margin)
+//   seconds of lead time when the burn starts.  Low-TWR rockets
+//   with long burn times can exit the atmosphere with less ETA
+//   to apoapsis than they need.  If that happens, a short prograde
+//   correction burn raises the apoapsis (and therefore the ETA)
+//   until the window is wide enough.  A guard prevents the
+//   correction from firing if the craft is already within 20 s of
+//   apoapsis, where a prograde burn raises periapsis instead.
 //
-//   v2 uses a NATURAL GRAVITY TURN:
-//     1. Fly straight up until the kick speed is reached.
-//     2. Apply a small one-time pitch kick toward east.
-//     3. Lock steering to the surface-prograde vector and let
-//        physics guide the pitch-over naturally.
-//   Thrust stays aligned with the velocity vector for the entire
-//   ascent, minimising both AoA drag and gravity losses.  The
-//   profile also self-adapts: a high-TWR rocket pitches over fast,
-//   a low-TWR rocket stays more vertical – no manual tuning needed.
-//
-//   Above 50 km the switch from surface-prograde to orbital prograde
-//   is negligible (atmosphere is thin) but gives a cleaner lock.
-//   Engines are cut once apoapsis is secured and the craft coasts
-//   out of the atmosphere before the circularisation burn, avoiding
-//   any Δv spent fighting residual drag.
+// v1 → v2 change
+//   Replaced the prescribed linear pitch schedule with a natural
+//   gravity turn (follow prograde after a small kick).  Keeps
+//   thrust aligned with the velocity vector → minimum AoA drag
+//   and gravity losses; self-adapts to any TWR.
 // ================================================================
 
 CLEARSCREEN.
@@ -77,7 +74,7 @@ FUNCTION burn_time {
 //  PHASE 0 – Pre-launch
 // ================================================================
 PRINT "╔══════════════════════════════════════════════╗".
-PRINT "║  KERBIN ORBITAL LAUNCH  v2  –  kOS           ║".
+PRINT "║  KERBIN ORBITAL LAUNCH  v3  –  kOS           ║".
 PRINT "╠══════════════════════════════════════════════╣".
 PRINT "║  Target orbit : " + TARGET_ALT/1000 + " km circular              ║".
 PRINT "║  Turn trigger : " + KICK_SPEED + " m/s surface speed         ║".
@@ -182,11 +179,40 @@ PRINT "  Circ Δv   : " + ROUND(dv, 1) + " m/s".
 PRINT "  Burn time : " + ROUND(bt,  1) + " s".
 PRINT "  ETA apo   : " + ROUND(ETA:APOAPSIS, 0) + " s".
 
+// ── Apoapsis timing check ────────────────────────────────────────
+// The burn must be centred on apoapsis, so it must START at
+// (burn_time / 2) seconds before apoapsis.  If ETA:APOAPSIS is
+// smaller than that required lead time we won't reach the start
+// cue before the window closes — especially likely for low-TWR
+// rockets with long burn times.
+//
+// Guard: skip correction if already within 20 s of apoapsis —
+// a prograde burn there raises periapsis rather than apoapsis and
+// would corrupt the orbit.  In that edge case just burn immediately
+// (slightly off-centre) and let the eccentricity check tighten it.
+LOCAL lead_needed IS bt / 2 + 30.  // half-burn + 30 s comfort margin
+
+IF ETA:APOAPSIS < lead_needed AND ETA:APOAPSIS > 20 {
+    PRINT "[TIMING] ETA " + ROUND(ETA:APOAPSIS, 0) + " s < required " + ROUND(lead_needed, 0) + " s.".
+    PRINT "  Prograde correction burn – extending apoapsis ETA…".
+    LOCK STEERING TO PROGRADE.
+    LOCK THROTTLE TO 0.2.
+    // Burn until there is enough lead time, or until apoapsis has
+    // risen to 3× target (safety cap to prevent runaway burn).
+    WAIT UNTIL ETA:APOAPSIS > burn_time(circ_dv()) + 60
+            OR SHIP:APOAPSIS > TARGET_ALT * 3.
+    LOCK THROTTLE TO 0.
+    SET dv TO circ_dv().
+    SET bt TO burn_time(dv).
+    PRINT "  Correction done. ETA: " + ROUND(ETA:APOAPSIS, 0) + " s  |  Apo: " + ROUND(SHIP:APOAPSIS / 1000, 1) + " km".
+    PRINT "  Updated circ Δv : " + ROUND(dv, 1) + " m/s  |  burn: " + ROUND(bt, 1) + " s".
+}
+
 // ================================================================
 //  PHASE 5 – Circularisation burn (centred on apoapsis)
 // ================================================================
-// Re-sample Δv and burn time just before the burn window so the
-// estimate uses the actual (post-coast) orbit and engine state.
+// Re-sample burn time live so the trigger stays accurate as mass
+// decreases during coast.
 WAIT UNTIL ETA:APOAPSIS <= burn_time(circ_dv()) / 2 + 5.
 LOCK STEERING TO PROGRADE.
 WAIT UNTIL ETA:APOAPSIS <= burn_time(circ_dv()) / 2.
