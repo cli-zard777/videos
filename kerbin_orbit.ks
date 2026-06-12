@@ -6,6 +6,11 @@
 //   Copy to Ships/Script/, open kOS terminal, type:  run kerbin_orbit.
 //
 // Changelog
+//   v7 – Fix steering/SAS ordering: LOCK STEERING is now set before
+//        SAS OFF so kOS takes authority with zero gap.  Setting SAS
+//        OFF first leaves one or more uncontrolled physics frames;
+//        even with reaction wheels + gimbal + fins that is enough to
+//        start a spin that the autopilot then fights rather than flies.
 //   v6 – Remove forced RCS OFF at launch.  Probe cores depend on
 //        RCS thrusters for attitude authority; forcing it off left
 //        kOS LOCK STEERING with nothing to act on.  RCS is now
@@ -90,20 +95,20 @@ FUNCTION burn_time {
 //  PHASE 0 – Pre-launch
 // ================================================================
 PRINT "╔══════════════════════════════════════════════╗".
-PRINT "║  KERBIN ORBITAL LAUNCH  v6  –  kOS           ║".
+PRINT "║  KERBIN ORBITAL LAUNCH  v7  –  kOS           ║".
 PRINT "╠══════════════════════════════════════════════╣".
 PRINT "║  Target orbit : " + TARGET_ALT/1000 + " km circular              ║".
 PRINT "║  Gravity turn : " + TURN_START/1000 + " km → " + TURN_END/1000 + " km                 ║".
 PRINT "╚══════════════════════════════════════════════╝".
 PRINT "".
 
-// SAS must be OFF for kOS to take steering control.
-// RCS is left in whatever state the player set — probe cores often
-// rely on RCS thrusters for attitude authority, so forcing it off
-// would leave kOS with nothing to steer with.
-SAS OFF.
+// Establish steering BEFORE dropping SAS.  If SAS is turned off
+// first there is a control gap where neither system holds attitude;
+// on a probe core (no pilot torque) that gap is enough to start a
+// tumble that gimbal and fins cannot recover from.
 LOCK THROTTLE TO 0.
 LOCK STEERING TO HEADING(90, 90).  // due east, straight up
+SAS OFF.                            // kOS now has authority with no gap
 
 FROM { LOCAL t IS 5. } UNTIL t = 0 STEP { SET t TO t-1. } DO {
     PRINT "  T-" + t + "…". WAIT 1.
