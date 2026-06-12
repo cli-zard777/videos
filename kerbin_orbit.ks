@@ -1,40 +1,30 @@
 // ================================================================
-// kerbin_orbit.ks  (v8)
+// kerbin_orbit.ks  (v9 – GUI config + optimised)
 // kOS  –  n-stage liquid rocket, circular equatorial Kerbin orbit
 //
 // How to use
 //   Copy to Ships/Script/, open kOS terminal, type:  run kerbin_orbit.
+//   A configuration window appears – set parameters, press LAUNCH.
 //
 // Changelog
-//   v8 – Fix auto-staging in two places:
-//        (1) Phase 1 (vertical ascent) had no staging loop at all –
-//            it was a bare WAIT UNTIL that never checked for flameout.
-//        (2) Both staging blocks used WAIT UNTIL AVAILABLETHRUST > 0
-//            OR NOT STAGE:READY which exits immediately after STAGE.
-//            because NOT STAGE:READY is true the instant staging fires,
-//            so throttle was restored before new engines ignited.
-//        Fixed by extracting do_stage() with a 5 s timeout wait on
-//        AVAILABLETHRUST and adding a proper staging loop to Phase 1.
-//   v7 – Fix LOCK STEERING before SAS OFF to eliminate attitude gap.
+//   v9 – Add kOS GUI for orbit/turn parameter selection before
+//        launch.  Refactor helpers to accept parameters (no globals
+//        shared between functions).  Consolidate staging into a
+//        single do_stage() called from every phase.
+//   v8 – Fix staging in vertical ascent (bare WAIT had no loop);
+//        fix STAGE:READY race condition in wait-for-thrust logic.
+//   v7 – Fix LOCK STEERING before SAS OFF (eliminate attitude gap).
 //   v6 – Remove forced RCS OFF (broke probe core attitude control).
-//   v5 – Revert gravity turn to linear pitch schedule; add circ staging.
+//   v5 – Revert gravity turn to linear pitch; add circ staging.
 //   v4 – Circularisation steers via maneuver node BURNVECTOR.
 //   v3 – Apoapsis timing check + correction burn for low-TWR craft.
-//   v2 – Natural gravity turn (follow prograde).
 // ================================================================
 
 CLEARSCREEN.
 
-// ── Configuration ────────────────────────────────────────────────
-LOCAL TARGET_ALT     IS 100000.  // m – target circular orbit altitude
-LOCAL TURN_START     IS  10000.  // m – begin pitching east
-LOCAL TURN_END       IS  45000.  // m – pitch-over complete (0°)
-LOCAL MAX_Q_THROTTLE IS    0.7.  // throttle cap through max-Q band
-LOCAL MAX_Q_ALT_LO   IS  20000.  // m – start throttle reduction
-LOCAL MAX_Q_ALT_HI   IS  35000.  // m – restore full throttle
-LOCAL ATMO_ALT       IS  70000.  // m – coast above this before circularising
-
-// ── Helpers ──────────────────────────────────────────────────────
+// ================================================================
+//  Helper functions
+// ================================================================
 
 FUNCTION engines_flameout {
     FOR eng IN SHIP:ENGINES {
@@ -54,19 +44,22 @@ FUNCTION avg_isp {
     RETURN s / n.
 }
 
-// Linear pitch interpolation from 90° (vertical) to 0° (horizontal).
+// Pitch angle during gravity turn (degrees above horizon).
 FUNCTION turn_pitch {
-    IF SHIP:ALTITUDE <= TURN_START { RETURN 90. }
-    IF SHIP:ALTITUDE >= TURN_END   { RETURN  0. }
-    LOCAL frac IS (SHIP:ALTITUDE - TURN_START) / (TURN_END - TURN_START).
-    RETURN 90 * (1 - frac).
+    PARAMETER ts. PARAMETER te.
+    IF SHIP:ALTITUDE <= ts { RETURN 90. }
+    IF SHIP:ALTITUDE >= te { RETURN  0. }
+    RETURN 90 * (1 - (SHIP:ALTITUDE - ts) / (te - ts)).
 }
 
-// Throttle cap through the max-Q band.
+// Throttle reduced during max-Q band.
 FUNCTION safe_throttle {
     PARAMETER nominal.
-    IF SHIP:ALTITUDE >= MAX_Q_ALT_LO AND SHIP:ALTITUDE <= MAX_Q_ALT_HI {
-        RETURN MIN(nominal, MAX_Q_THROTTLE).
+    PARAMETER mq_cap.
+    PARAMETER mq_lo.
+    PARAMETER mq_hi.
+    IF SHIP:ALTITUDE >= mq_lo AND SHIP:ALTITUDE <= mq_hi {
+        RETURN MIN(nominal, mq_cap).
     }
     RETURN nominal.
 }
@@ -89,16 +82,14 @@ FUNCTION burn_time {
     RETURN (SHIP:MASS - m1) * ve / F.
 }
 
-// Separate a depleted stage and wait for the next engines to confirm
-// thrust.  Uses a 5 s timeout so the script never hangs if the next
-// stage has no engines (e.g. a coast / fairing stage).
-// Do NOT use STAGE:READY as the wait condition – it goes true again
-// almost immediately after STAGE. fires, causing throttle to be
-// restored before the new engines have ignited.
+// Separate a depleted stage; wait up to 5 s for the next engines.
+// Uses a timeout rather than STAGE:READY – STAGE:READY goes true
+// again almost instantly after STAGE. fires, so it cannot be used
+// as a reliable "wait for engines" signal.
 FUNCTION do_stage {
     PRINT "  [STAGE] Burnout – separating stage.".
     LOCK THROTTLE TO 0.
-    WAIT 0.5.                            // brief coast for clean separation
+    WAIT 0.5.
     STAGE.
     LOCAL t IS TIME:SECONDS.
     WAIT UNTIL AVAILABLETHRUST > 0 OR (TIME:SECONDS - t) > 5.
@@ -106,163 +97,246 @@ FUNCTION do_stage {
         LOCK THROTTLE TO 1.0.
         PRINT "  [STAGE] Next stage ignited.".
     } ELSE {
-        PRINT "  [STAGE] WARNING: no thrust after stage – check vehicle.".
+        PRINT "  [STAGE] WARNING: no thrust after staging.".
     }
 }
 
 // ================================================================
-//  PHASE 0 – Pre-launch
+//  Configuration GUI
 // ================================================================
-PRINT "╔══════════════════════════════════════════════╗".
-PRINT "║  KERBIN ORBITAL LAUNCH  v8  –  kOS           ║".
-PRINT "╠══════════════════════════════════════════════╣".
-PRINT "║  Target orbit : " + TARGET_ALT/1000 + " km circular              ║".
-PRINT "║  Gravity turn : " + TURN_START/1000 + " km → " + TURN_END/1000 + " km                 ║".
-PRINT "╚══════════════════════════════════════════════╝".
-PRINT "".
 
-// Establish steering BEFORE dropping SAS so kOS takes authority
-// with no gap – even one uncontrolled physics frame can start a spin.
-LOCK THROTTLE TO 0.
-LOCK STEERING TO HEADING(90, 90).  // due east, straight up
-SAS OFF.
+FUNCTION show_config_gui {
+    LOCAL win IS GUI(390).
+    SET win:X TO 100.
+    SET win:Y TO 80.
 
-FROM { LOCAL t IS 5. } UNTIL t = 0 STEP { SET t TO t-1. } DO {
-    PRINT "  T-" + t + "…". WAIT 1.
-}
-PRINT "[T-0] IGNITION".
-PRINT "".
+    // ── Title ────────────────────────────────────────────────────
+    LOCAL ttl IS win:ADDLABEL("  KERBIN ORBITAL LAUNCH  v9  ").
+    SET ttl:STYLE:ALIGN TO "CENTER".
+    SET ttl:STYLE:FONTSIZE TO 13.
+    win:ADDSPACING(6).
 
-// ================================================================
-//  PHASE 1 – Vertical ascent to TURN_START
-// ================================================================
-STAGE.
-LOCK THROTTLE TO 1.0.
-WAIT UNTIL SHIP:ALTITUDE > 100.  // clear the pad
+    // ── Target orbit altitude ────────────────────────────────────
+    LOCAL r1 IS win:ADDHBOX().
+    LOCAL l1 IS r1:ADDLABEL("Target Orbit Altitude (km):").
+    SET l1:STYLE:WIDTH TO 230.
+    LOCAL alt_field IS r1:ADDTEXTFIELD("100").
+    SET alt_field:STYLE:WIDTH TO 80.
 
-PRINT "[PHASE 1] Vertical ascent to " + TURN_START/1000 + " km".
+    win:ADDSPACING(4).
 
-// Loop (not a bare WAIT) so flameout during vertical ascent is caught.
-UNTIL SHIP:ALTITUDE >= TURN_START {
-    IF engines_flameout() AND STAGE:READY { do_stage(). }
-    WAIT 0.05.
-}
+    // ── Gravity turn ─────────────────────────────────────────────
+    LOCAL r2 IS win:ADDHBOX().
+    LOCAL l2 IS r2:ADDLABEL("Gravity Turn Start (km):").
+    SET l2:STYLE:WIDTH TO 230.
+    LOCAL ts_field IS r2:ADDTEXTFIELD("10").
+    SET ts_field:STYLE:WIDTH TO 80.
 
-// ================================================================
-//  PHASE 2 – Gravity turn + staging
-// ================================================================
-PRINT "[PHASE 2] Gravity turn (" + TURN_START/1000 + " km → " + TURN_END/1000 + " km)".
+    LOCAL r3 IS win:ADDHBOX().
+    LOCAL l3 IS r3:ADDLABEL("Gravity Turn End (km):").
+    SET l3:STYLE:WIDTH TO 230.
+    LOCAL te_field IS r3:ADDTEXTFIELD("45").
+    SET te_field:STYLE:WIDTH TO 80.
 
-UNTIL SHIP:APOAPSIS >= TARGET_ALT {
+    win:ADDSPACING(4).
 
-    // ── Pitch schedule ─────────────────────────────────────────
-    LOCK STEERING TO HEADING(90, turn_pitch()).
+    // ── Max-Q throttle ───────────────────────────────────────────
+    LOCAL r4 IS win:ADDHBOX().
+    LOCAL l4 IS r4:ADDLABEL("Max-Q Throttle Cap (%):").
+    SET l4:STYLE:WIDTH TO 230.
+    LOCAL maxq_field IS r4:ADDTEXTFIELD("70").
+    SET maxq_field:STYLE:WIDTH TO 80.
 
-    // ── Throttle (max-Q cap + apoapsis taper) ──────────────────
-    LOCAL ratio IS SHIP:APOAPSIS / TARGET_ALT.
-    LOCAL nominal IS 1.0.
-    IF ratio > 0.90 {
-        SET nominal TO MAX(0.05, (1.0 - ratio) * 10).
-    }
-    LOCK THROTTLE TO safe_throttle(nominal).
+    win:ADDSPACING(8).
 
-    // ── Staging ────────────────────────────────────────────────
-    IF engines_flameout() AND STAGE:READY { do_stage(). }
+    // ── Validation error label ───────────────────────────────────
+    LOCAL err_lbl IS win:ADDLABEL("").
+    SET err_lbl:STYLE:ALIGN TO "CENTER".
+    SET err_lbl:STYLE:TEXTCOLOR TO RGB(1, 0.3, 0.3).
 
-    WAIT 0.05.
-}
+    win:ADDSPACING(4).
 
-// ================================================================
-//  PHASE 3 – Cut engines, coast above atmosphere
-// ================================================================
-LOCK THROTTLE TO 0.
-LOCK STEERING TO PROGRADE.
+    // ── Buttons ──────────────────────────────────────────────────
+    LOCAL btn_row IS win:ADDHBOX().
+    btn_row:ADDSPACING(30).
+    LOCAL launch_btn IS btn_row:ADDBUTTON("   LAUNCH   ").
+    btn_row:ADDSPACING(20).
+    LOCAL cancel_btn IS btn_row:ADDBUTTON("   CANCEL   ").
 
-PRINT "[PHASE 3] Apoapsis secured – coasting.".
-PRINT "  Apoapsis  : " + ROUND(SHIP:APOAPSIS  / 1000, 1) + " km".
-PRINT "  Periapsis : " + ROUND(SHIP:PERIAPSIS / 1000, 1) + " km".
+    win:SHOW().
 
-WAIT UNTIL SHIP:ALTITUDE >= ATMO_ALT.
+    LOCAL cfg IS LEXICON("ok", FALSE).
 
-LOCAL dv IS circ_dv().
-LOCAL bt IS burn_time(dv).
-PRINT "  Circ Δv   : " + ROUND(dv, 1) + " m/s".
-PRINT "  Burn time : " + ROUND(bt,  1) + " s".
-PRINT "  ETA apo   : " + ROUND(ETA:APOAPSIS, 0) + " s".
+    UNTIL cfg["ok"] OR cancel_btn:PRESSED {
+        IF launch_btn:PRESSED {
+            SET err_lbl:TEXT TO "".
 
-// ── Apoapsis timing check ────────────────────────────────────────
-LOCAL lead_needed IS bt / 2 + 30.
-IF ETA:APOAPSIS < lead_needed AND ETA:APOAPSIS > 20 {
-    PRINT "[TIMING] ETA " + ROUND(ETA:APOAPSIS, 0) + " s < required " + ROUND(lead_needed, 0) + " s.".
-    PRINT "  Extending apoapsis…".
-    LOCK STEERING TO PROGRADE.
-    LOCK THROTTLE TO 0.2.
-    WAIT UNTIL ETA:APOAPSIS > burn_time(circ_dv()) + 60
-            OR SHIP:APOAPSIS > TARGET_ALT * 3.
-    LOCK THROTTLE TO 0.
-    SET dv TO circ_dv().
-    SET bt TO burn_time(dv).
-    PRINT "  New ETA: " + ROUND(ETA:APOAPSIS, 0) + " s  |  Apo: " + ROUND(SHIP:APOAPSIS / 1000, 1) + " km".
-}
+            LOCAL t_alt   IS alt_field:TEXT:TONUMBER(-1)  * 1000.
+            LOCAL t_start IS ts_field:TEXT:TONUMBER(-1)   * 1000.
+            LOCAL t_end   IS te_field:TEXT:TONUMBER(-1)   * 1000.
+            LOCAL t_maxq  IS maxq_field:TEXT:TONUMBER(-1) / 100.
 
-// ================================================================
-//  PHASE 4 – Circularisation burn via maneuver node
-// ================================================================
-LOCAL nd IS NODE(TIME:SECONDS + ETA:APOAPSIS, 0, 0, dv).
-ADD nd.
-
-PRINT "[PHASE 4] Circularisation node created.".
-PRINT "  Node Δv   : " + ROUND(nd:DELTAV:MAG, 1) + " m/s".
-PRINT "  Node ETA  : " + ROUND(nd:ETA, 0) + " s".
-PRINT "  Burn time : " + ROUND(burn_time(nd:DELTAV:MAG), 1) + " s".
-
-LOCK STEERING TO nd:BURNVECTOR.
-WAIT UNTIL nd:ETA <= burn_time(nd:DELTAV:MAG) / 2 + 5.
-LOCK STEERING TO nd:BURNVECTOR.
-WAIT UNTIL nd:ETA <= burn_time(nd:DELTAV:MAG) / 2.
-
-PRINT "[PHASE 4] Circularisation – IGNITION.".
-LOCK THROTTLE TO 1.0.
-
-UNTIL nd:DELTAV:MAG < 0.5 {
-
-    // ── Auto-staging mid-burn ─────────────────────────────────
-    IF engines_flameout() AND STAGE:READY {
-        PRINT "  [STAGE] Stage boundary during circ burn.".
-        LOCK THROTTLE TO 0.
-        WAIT 0.5.
-        STAGE.
-        LOCAL st IS TIME:SECONDS.
-        WAIT UNTIL AVAILABLETHRUST > 0 OR (TIME:SECONDS - st) > 5.
-        IF AVAILABLETHRUST > 0 {
-            LOCK STEERING TO nd:BURNVECTOR.
-            LOCK THROTTLE TO 1.0.
-            PRINT "  [STAGE] Circ burn resumed.".
+            // Validate inputs
+            IF t_alt < 0 {
+                SET err_lbl:TEXT TO "Invalid target altitude.".
+            } ELSE IF t_alt < 75000 {
+                SET err_lbl:TEXT TO "Target altitude must be above 75 km (atmosphere).".
+            } ELSE IF t_start < 0 OR t_end < 0 {
+                SET err_lbl:TEXT TO "Invalid turn altitude.".
+            } ELSE IF t_start >= t_end {
+                SET err_lbl:TEXT TO "Turn start must be below turn end.".
+            } ELSE IF t_maxq < 0 OR t_maxq > 1 {
+                SET err_lbl:TEXT TO "Max-Q throttle must be between 1 and 100.".
+            } ELSE {
+                SET cfg["ok"]         TO TRUE.
+                SET cfg["target_alt"] TO t_alt.
+                SET cfg["turn_start"] TO t_start.
+                SET cfg["turn_end"]   TO t_end.
+                SET cfg["max_q"]      TO t_maxq.
+            }
         }
+        WAIT 0.
     }
 
-    LOCAL rem IS nd:DELTAV:MAG.
-    IF      rem < 5  { LOCK THROTTLE TO 0.02. }
-    ELSE IF rem < 20 { LOCK THROTTLE TO 0.10. }
-    ELSE IF rem < 80 { LOCK THROTTLE TO 0.35. }
-    ELSE             { LOCK THROTTLE TO 1.0.  }
-    WAIT 0.05.
+    win:HIDE().
+    win:DISPOSE().
+    RETURN cfg.
 }
-LOCK THROTTLE TO 0.
-REMOVE nd.
 
 // ================================================================
-//  Complete
+//  Main
 // ================================================================
-PRINT "".
-PRINT "╔══════════════════════════════════════════════╗".
-PRINT "║           ORBIT ACHIEVED                     ║".
-PRINT "╠══════════════════════════════════════════════╣".
-PRINT "║  Apoapsis    : " + ROUND(SHIP:APOAPSIS  / 1000, 2) + " km             ║".
-PRINT "║  Periapsis   : " + ROUND(SHIP:PERIAPSIS / 1000, 2) + " km             ║".
-PRINT "║  Eccentricity: " + ROUND(ORBIT:ECCENTRICITY, 5) + "              ║".
-PRINT "╚══════════════════════════════════════════════╝".
 
-UNLOCK THROTTLE.
-UNLOCK STEERING.
-SAS ON.
+LOCAL cfg IS show_config_gui().
+
+IF NOT cfg["ok"] {
+    PRINT "Launch cancelled.".
+} ELSE {
+
+    LOCAL TARGET_ALT     IS cfg["target_alt"].
+    LOCAL TURN_START     IS cfg["turn_start"].
+    LOCAL TURN_END       IS cfg["turn_end"].
+    LOCAL MAX_Q_THROTTLE IS cfg["max_q"].
+    LOCAL MAX_Q_LO       IS 20000.
+    LOCAL MAX_Q_HI       IS 35000.
+    LOCAL ATMO_ALT       IS 70000.
+
+    CLEARSCREEN.
+    PRINT "╔══════════════════════════════════════════════╗".
+    PRINT "║  KERBIN ORBITAL LAUNCH  v9  –  kOS           ║".
+    PRINT "╠══════════════════════════════════════════════╣".
+    PRINT "║  Target orbit  : " + TARGET_ALT/1000 + " km                      ║".
+    PRINT "║  Gravity turn  : " + TURN_START/1000 + " km → " + TURN_END/1000 + " km              ║".
+    PRINT "║  Max-Q cap     : " + ROUND(MAX_Q_THROTTLE*100,0) + "%                        ║".
+    PRINT "╚══════════════════════════════════════════════╝".
+    PRINT "".
+
+    // ── Phase 0: Pre-launch ──────────────────────────────────────
+    LOCK THROTTLE TO 0.
+    LOCK STEERING TO HEADING(90, 90).
+    SAS OFF.
+
+    FROM { LOCAL t IS 5. } UNTIL t = 0 STEP { SET t TO t-1. } DO {
+        PRINT "  T-" + t + "…". WAIT 1.
+    }
+    PRINT "[T-0] IGNITION".
+    PRINT "".
+
+    // ── Phase 1: Vertical ascent ─────────────────────────────────
+    STAGE.
+    LOCK THROTTLE TO 1.0.
+    WAIT UNTIL SHIP:ALTITUDE > 100.
+
+    PRINT "[PHASE 1] Vertical ascent to " + TURN_START/1000 + " km".
+    UNTIL SHIP:ALTITUDE >= TURN_START {
+        IF engines_flameout() AND STAGE:READY { do_stage(). }
+        WAIT 0.05.
+    }
+
+    // ── Phase 2: Gravity turn ────────────────────────────────────
+    PRINT "[PHASE 2] Gravity turn (" + TURN_START/1000 + " km → " + TURN_END/1000 + " km)".
+    UNTIL SHIP:APOAPSIS >= TARGET_ALT {
+        LOCK STEERING TO HEADING(90, turn_pitch(TURN_START, TURN_END)).
+        LOCAL ratio IS SHIP:APOAPSIS / TARGET_ALT.
+        LOCAL nominal IS 1.0.
+        IF ratio > 0.90 { SET nominal TO MAX(0.05, (1.0 - ratio) * 10). }
+        LOCK THROTTLE TO safe_throttle(nominal, MAX_Q_THROTTLE, MAX_Q_LO, MAX_Q_HI).
+        IF engines_flameout() AND STAGE:READY { do_stage(). }
+        WAIT 0.05.
+    }
+
+    // ── Phase 3: Coast above atmosphere ──────────────────────────
+    LOCK THROTTLE TO 0.
+    LOCK STEERING TO PROGRADE.
+    PRINT "[PHASE 3] Coasting – apo " + ROUND(SHIP:APOAPSIS/1000,1) + " km".
+    WAIT UNTIL SHIP:ALTITUDE >= ATMO_ALT.
+
+    LOCAL dv IS circ_dv().
+    LOCAL bt IS burn_time(dv).
+    PRINT "  Circ Δv: " + ROUND(dv,1) + " m/s  burn: " + ROUND(bt,1) + " s  ETA: " + ROUND(ETA:APOAPSIS,0) + " s".
+
+    // Apoapsis timing correction for low-TWR craft.
+    IF ETA:APOAPSIS < bt/2 + 30 AND ETA:APOAPSIS > 20 {
+        PRINT "[TIMING] Insufficient lead time – extending apoapsis…".
+        LOCK STEERING TO PROGRADE.
+        LOCK THROTTLE TO 0.2.
+        WAIT UNTIL ETA:APOAPSIS > burn_time(circ_dv()) + 60
+                OR SHIP:APOAPSIS > TARGET_ALT * 3.
+        LOCK THROTTLE TO 0.
+        SET dv TO circ_dv().
+        SET bt TO burn_time(dv).
+        PRINT "  New apo: " + ROUND(SHIP:APOAPSIS/1000,1) + " km  ETA: " + ROUND(ETA:APOAPSIS,0) + " s".
+    }
+
+    // ── Phase 4: Circularisation via maneuver node ────────────────
+    LOCAL nd IS NODE(TIME:SECONDS + ETA:APOAPSIS, 0, 0, dv).
+    ADD nd.
+    PRINT "[PHASE 4] Circ node: " + ROUND(nd:DELTAV:MAG,1) + " m/s  ETA: " + ROUND(nd:ETA,0) + " s".
+
+    LOCK STEERING TO nd:BURNVECTOR.
+    WAIT UNTIL nd:ETA <= burn_time(nd:DELTAV:MAG) / 2 + 5.
+    LOCK STEERING TO nd:BURNVECTOR.
+    WAIT UNTIL nd:ETA <= burn_time(nd:DELTAV:MAG) / 2.
+
+    PRINT "[PHASE 4] Circularisation – IGNITION.".
+    LOCK THROTTLE TO 1.0.
+
+    UNTIL nd:DELTAV:MAG < 0.5 {
+        // Auto-staging mid-burn (inline to allow nd:BURNVECTOR re-lock).
+        IF engines_flameout() AND STAGE:READY {
+            PRINT "  [STAGE] Stage boundary during circ burn.".
+            LOCK THROTTLE TO 0.
+            WAIT 0.5.
+            STAGE.
+            LOCAL st IS TIME:SECONDS.
+            WAIT UNTIL AVAILABLETHRUST > 0 OR (TIME:SECONDS - st) > 5.
+            IF AVAILABLETHRUST > 0 {
+                LOCK STEERING TO nd:BURNVECTOR.
+                LOCK THROTTLE TO 1.0.
+                PRINT "  [STAGE] Circ burn resumed.".
+            }
+        }
+        LOCAL rem IS nd:DELTAV:MAG.
+        IF      rem < 5  { LOCK THROTTLE TO 0.02. }
+        ELSE IF rem < 20 { LOCK THROTTLE TO 0.10. }
+        ELSE IF rem < 80 { LOCK THROTTLE TO 0.35. }
+        ELSE             { LOCK THROTTLE TO 1.0.  }
+        WAIT 0.05.
+    }
+    LOCK THROTTLE TO 0.
+    REMOVE nd.
+
+    // ── Complete ─────────────────────────────────────────────────
+    PRINT "".
+    PRINT "╔══════════════════════════════════════════════╗".
+    PRINT "║           ORBIT ACHIEVED                     ║".
+    PRINT "╠══════════════════════════════════════════════╣".
+    PRINT "║  Apoapsis    : " + ROUND(SHIP:APOAPSIS  /1000,2) + " km             ║".
+    PRINT "║  Periapsis   : " + ROUND(SHIP:PERIAPSIS /1000,2) + " km             ║".
+    PRINT "║  Eccentricity: " + ROUND(ORBIT:ECCENTRICITY,5) + "              ║".
+    PRINT "╚══════════════════════════════════════════════╝".
+
+    UNLOCK THROTTLE.
+    UNLOCK STEERING.
+    SAS ON.
+}
