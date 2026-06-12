@@ -6,6 +6,10 @@
 //   Copy to Ships/Script/, open kOS terminal, type:  run kerbin_orbit.
 //
 // Changelog
+//   v6 – Remove forced RCS OFF at launch.  Probe cores depend on
+//        RCS thrusters for attitude authority; forcing it off left
+//        kOS LOCK STEERING with nothing to act on.  RCS is now
+//        left in whatever state the player configured.
 //   v5 – Revert gravity turn to original controlled pitch schedule
 //        (linear 90°→0° from TURN_START to TURN_END altitude).
 //        Add auto-staging inside the circularisation burn so a
@@ -86,14 +90,18 @@ FUNCTION burn_time {
 //  PHASE 0 – Pre-launch
 // ================================================================
 PRINT "╔══════════════════════════════════════════════╗".
-PRINT "║  KERBIN ORBITAL LAUNCH  v5  –  kOS           ║".
+PRINT "║  KERBIN ORBITAL LAUNCH  v6  –  kOS           ║".
 PRINT "╠══════════════════════════════════════════════╣".
 PRINT "║  Target orbit : " + TARGET_ALT/1000 + " km circular              ║".
 PRINT "║  Gravity turn : " + TURN_START/1000 + " km → " + TURN_END/1000 + " km                 ║".
 PRINT "╚══════════════════════════════════════════════╝".
 PRINT "".
 
-SAS OFF. RCS OFF.
+// SAS must be OFF for kOS to take steering control.
+// RCS is left in whatever state the player set — probe cores often
+// rely on RCS thrusters for attitude authority, so forcing it off
+// would leave kOS with nothing to steer with.
+SAS OFF.
 LOCK THROTTLE TO 0.
 LOCK STEERING TO HEADING(90, 90).  // due east, straight up
 
