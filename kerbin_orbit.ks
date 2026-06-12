@@ -5,6 +5,14 @@
 // How to use
 //   Copy to Ships/Script/, open kOS terminal, type:  run kerbin_orbit.
 //
+// v3 → v4 change
+//   Circularisation now steers to the maneuver node's BURNVECTOR
+//   instead of raw PROGRADE.  During a long burn the prograde
+//   vector drifts as the orbit evolves, pushing the burn off-axis
+//   and raising the apoapsis.  BURNVECTOR always points in the
+//   direction of the *remaining* Δv needed to hit the target orbit,
+//   so it self-corrects throughout the burn.
+//
 // v2 → v3 change
 //   Added an apoapsis-timing check after the craft exits the
 //   atmosphere.  The circularisation burn must be centred on
@@ -74,7 +82,7 @@ FUNCTION burn_time {
 //  PHASE 0 – Pre-launch
 // ================================================================
 PRINT "╔══════════════════════════════════════════════╗".
-PRINT "║  KERBIN ORBITAL LAUNCH  v3  –  kOS           ║".
+PRINT "║  KERBIN ORBITAL LAUNCH  v4  –  kOS           ║".
 PRINT "╠══════════════════════════════════════════════╣".
 PRINT "║  Target orbit : " + TARGET_ALT/1000 + " km circular              ║".
 PRINT "║  Turn trigger : " + KICK_SPEED + " m/s surface speed         ║".
@@ -209,19 +217,34 @@ IF ETA:APOAPSIS < lead_needed AND ETA:APOAPSIS > 20 {
 }
 
 // ================================================================
-//  PHASE 5 – Circularisation burn (centred on apoapsis)
+//  PHASE 5 – Circularisation burn via maneuver node
 // ================================================================
-// Re-sample burn time live so the trigger stays accurate as mass
-// decreases during coast.
-WAIT UNTIL ETA:APOAPSIS <= burn_time(circ_dv()) / 2 + 5.
-LOCK STEERING TO PROGRADE.
-WAIT UNTIL ETA:APOAPSIS <= burn_time(circ_dv()) / 2.
+// Steering to nd:BURNVECTOR rather than raw PROGRADE is critical.
+// Raw PROGRADE drifts during a long burn as the orbit evolves,
+// which tips the burn off-axis and raises the apoapsis instead of
+// holding it fixed while periapsis climbs.  The node's BURNVECTOR
+// always points in the direction of the REMAINING Δv needed to
+// achieve the target orbit, so it self-corrects throughout the burn.
 
-PRINT "[PHASE 5] Circularisation burn.".
+LOCAL nd IS NODE(TIME:SECONDS + ETA:APOAPSIS, 0, 0, circ_dv()).
+ADD nd.
+
+PRINT "[PHASE 5] Circularisation node created.".
+PRINT "  Node Δv   : " + ROUND(nd:DELTAV:MAG, 1) + " m/s".
+PRINT "  Node ETA  : " + ROUND(nd:ETA, 0) + " s".
+PRINT "  Burn time : " + ROUND(burn_time(nd:DELTAV:MAG), 1) + " s".
+
+// Orient toward the burn vector with plenty of lead time.
+LOCK STEERING TO nd:BURNVECTOR.
+WAIT UNTIL nd:ETA <= burn_time(nd:DELTAV:MAG) / 2 + 5.
+LOCK STEERING TO nd:BURNVECTOR.   // re-lock after potential warp drift
+WAIT UNTIL nd:ETA <= burn_time(nd:DELTAV:MAG) / 2.
+
+PRINT "[PHASE 5] Circularisation burn – IGNITION.".
 LOCK THROTTLE TO 1.0.
 
-UNTIL ORBIT:ECCENTRICITY < 0.005 AND SHIP:PERIAPSIS >= TARGET_ALT * 0.95 {
-    LOCAL rem IS circ_dv().
+UNTIL nd:DELTAV:MAG < 0.5 {
+    LOCAL rem IS nd:DELTAV:MAG.
     IF      rem < 5  { LOCK THROTTLE TO 0.02. }
     ELSE IF rem < 20 { LOCK THROTTLE TO 0.10. }
     ELSE IF rem < 80 { LOCK THROTTLE TO 0.35. }
@@ -229,6 +252,7 @@ UNTIL ORBIT:ECCENTRICITY < 0.005 AND SHIP:PERIAPSIS >= TARGET_ALT * 0.95 {
     WAIT 0.05.
 }
 LOCK THROTTLE TO 0.
+REMOVE nd.
 
 // ================================================================
 //  Complete
